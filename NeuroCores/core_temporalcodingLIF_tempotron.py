@@ -89,7 +89,7 @@ def neurons(net, time, phase = 'training'):
     if time > 0:
         # if this isn't the first step copy the accumulators
         # from the previous step onto the new one
-        if phase = 'test':
+        if phase == 'test':
             net.state.NeurAccumForTest[time] = net.state.NeurAccumForTest[time-1]
         else:
             net.state.NeurAccum[time] = net.state.NeurAccum[time-1]
@@ -105,7 +105,7 @@ def neurons(net, time, phase = 'training'):
     v_0 = 1 / v_max
     v_rest = net.params.get('VREST', 0)
     for postidx in range(net.inputNum, net.NETSIZE):
-        if phase = 'test':
+        if phase == 'test':
             for preidx in np.where(net.ConnMat[:, postidx, 0] != 0)[0]:
 
                 t_i = t_i_hist(net, preidx, net.state.lastSpikeTrain + 1, time)
