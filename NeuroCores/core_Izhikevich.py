@@ -65,7 +65,7 @@ def neurons(net, time, phase = 'training'):
     outputLabelMask = np.hstack((np.zeros(net.NETSIZE - net.outputNum), np.ones(net.outputNum))) # mask matrix to extract output labels.  Size: NETSIZE
 
     inputStim = np.bitwise_and([int(x) for x in inputStimMask], [int(x) for x in stimin])   # split input stimulus and output labels
-    outputLabel = np.bitwise_and([int(x) for x in outputLabelMask], [int(x) for x in stimin]
+    outputLabel = np.bitwise_and([int(x) for x in outputLabelMask], [int(x) for x in stimin])
 
     # Izhikevich neuron model: v' = 0.04v^2 + 5v + 140 - u + I
     # u' = a(bv - u)
