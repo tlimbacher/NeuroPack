@@ -1,0 +1,3 @@
+[submodule "robot_arm_l2l"]
+	path = robot_arm_l2l
+	url = git@gitlab.tugraz.at:D6625483838E07E8/robot_arm_l2l.git

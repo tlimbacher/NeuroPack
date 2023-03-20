@@ -1,3 +1,5 @@
+import pickle
+import tensorflow
 from PyQt5 import QtGui, QtCore, QtWidgets
 import sys
 import os
@@ -17,12 +19,18 @@ from arc1pyqt.VirtualArC import read as VirtualArCRead
 from arc1pyqt.VirtualArC.parametric_device import ParametricDevice as memristor
 from arc1pyqt.Globals import functions
 from arc1pyqt import state
+from tensorflow import float32
+
 HW = state.hardware
 APP = state.app
 CB = state.crossbar
 from arc1pyqt import modutils
 from arc1pyqt.modutils import BaseThreadWrapper, BaseProgPanel, \
         makeDeviceList, ModTag
+
+from arc1pyqt.ProgPanels.NeuroPack.robot_arm_l2l import main as L2LMain
+
+from arc1pyqt.ProgPanels.NeuroPack.NeuroCores.memristorPulses import memristorPulses as memristorPulses
 
 THIS_DIR = os.path.dirname(__file__)
 for ui in ['nnanalysis', 'nnvarsnaprow']:
@@ -64,6 +72,15 @@ class NetworkState(object):
         self.fireHistForTest = np.array((DEPTH+1)*[NETSIZE*[0.0]]) #New for test
         self.firingCells = np.array(NETSIZE  * [0.0])
         self.firingCellsPseudo = np.array(NETSIZE*[0.0])
+
+        # The last time step a given neuron fired in, to take into account refractory times.
+        self.LastFiringTimes = np.full(shape=NETSIZE - inputNum, fill_value=-1)
+        self.trace = np.array(epochs * labelCounter * [(NETSIZE-outputNum) * [0.0]])
+        self.dz_dh = np.array(epochs * labelCounter * [(NETSIZE-outputNum-inputNum) * [0.0]])  # Only recurrent layer.
+
+        # index pre_syn, post_syn 0=pre_weight, 1=error, 2:type i.e. 1 = increase -1 = reduce
+        self.weight_update_errors = np.array((NETSIZE - outputNum) * [(NETSIZE - inputNum) * [[0.0, 0.0, 0.0]]])
+
         self.outputFlag = 0
         self.neuronFixed = 0
         self.fixedNeuronID = -1
@@ -80,6 +97,8 @@ class NetworkState(object):
 
         self.temporalCoding_enable = temporalCoding_enable
         self.spikeTrain = spikeTrain
+
+        self.test = False
 
         if self.temporalCoding_enable == 1:
             self.errorSteps = epochs // self.spikeTrain
@@ -157,6 +176,7 @@ class Network(BaseThreadWrapper):
     def __init__(self, conn_mat, stimin, stiminForTesting, test_enable, data, params, tsteps, testSteps, core, labelCounter=1):
         super(Network, self).__init__()
 
+        self.OrigConnMat = conn_mat
         self.ConnMat = conn_mat
         self.stimin = stimin
         self.stiminForTesting = stiminForTesting
@@ -220,6 +240,9 @@ class Network(BaseThreadWrapper):
         self.plot_counter = 0
         self.spikeTrainStep = 0
 
+        self.pre_crossbar = None
+        self.post_crossbar = None
+
         self.core = self.load_core(core)
 
     def log(self, *args, **kwargs):
@@ -229,13 +252,94 @@ class Network(BaseThreadWrapper):
     def load_core(self, corename):
         from pkgutil import iter_modules
         import importlib
-        basecoremod = 'arc1pyqt.ExtPanels.NeuroPack.NeuroCores'
+        basecoremod = 'arc1pyqt.ProgPanels.NeuroPack.NeuroCores'
 
         for (finder, name, ispkg) in iter_modules(NeuroCores.__path__):
             loader = finder.find_module(name)
             if name == corename:
                 mod = importlib.import_module('%s.%s' % (basecoremod, name))
                 return mod
+
+    def de_normalise_resistance(self, w):
+        PCEIL = 1.0 / self.params['PFLOOR']  # conductance ceil
+        PFLOOR = 1.0 / self.params['PCEIL']  # conductance floor
+
+        C = (w/3.0) * (PCEIL - PFLOOR) / self.params['WEIGHTSCALE'] + PFLOOR
+        R = 1 / C
+        return R
+
+    def normalise_weight(net, w):
+        PCEIL = 1.0 / net.params['PFLOOR']
+        PFLOOR = 1.0 / net.params['PCEIL']
+
+        val = (net.params['WEIGHTSCALE'] * (float(w) - PFLOOR) / (PCEIL - PFLOOR)) * 3.0
+
+        # Clamp weights in-between 0.0 and 1.0
+        if val < 0.0:
+            return 0.0
+        elif val > 3.0:
+            return 3.0
+        else:
+            return val
+
+    def experimental_init(self):
+        """
+        Load predefined weights for trainee.
+        """
+        if not isinstance(HW.ArC, VirtualArC):
+            return
+
+        HW.ArC.crossbar = [[None] for x in range(301)]
+        weights = pickle.load(open("lsg-weights.pickle", 'rb'))
+
+        in_size = 5
+        rec_size = 250
+        out_size = 2
+
+        curr_bitline = 1
+        curr_wordline = 1
+
+        for i in range(in_size):
+            for j in range(rec_size):
+                weight = int(self.de_normalise_resistance(abs(weights['W_in_trainee'][i][j])))
+                print(f"At w:{curr_wordline} b:{curr_bitline} weight={abs(weights['W_in_trainee'][i][j])} res={weight}, back = {self.normalise_weight(1./weight)}")
+                mx = memristor(Ap=self.Ap, An=self.An, tp=self.tp, tn=self.tn, a0p=self.a0p, a0n=self.a0n, a1p=self.a1p,
+                               a1n=self.a1n)
+                mx.initialise(weight)
+                HW.ArC.crossbar[curr_wordline].append(mx)
+                # self.state.weights[i, j+5-in_size, 0] = abs(weights['W_in_trainee'][i][j])
+                if curr_bitline % 300 == 0:
+                    curr_wordline += 1
+                    curr_bitline = 0
+                curr_bitline += 1
+
+        for i in range(rec_size):
+            for j in range(rec_size):
+                if i == j:  # No recursive self connections.
+                    continue
+                weight = int(self.de_normalise_resistance(abs(weights['W_rec_trainee'][i][j])))
+                mx = memristor(Ap=self.Ap, An=self.An, tp=self.tp, tn=self.tn, a0p=self.a0p, a0n=self.a0n, a1p=self.a1p,
+                               a1n=self.a1n)
+                mx.initialise(weight)
+                HW.ArC.crossbar[curr_wordline].append(mx)
+                # self.state.weights[i + 5, j + 5 - in_size, 0] = abs(weights['W_rec_trainee'][i][j])
+                if curr_bitline % 300 == 0:
+                    curr_wordline += 1
+                    curr_bitline = 0
+                curr_bitline += 1
+
+        for i in range(rec_size):
+            for j in range(out_size):
+                weight = int(self.de_normalise_resistance(abs(weights['W_out_trainee'][i][j])))
+                mx = memristor(Ap=self.Ap, An=self.An, tp=self.tp, tn=self.tn, a0p=self.a0p, a0n=self.a0n, a1p=self.a1p,
+                              a1n=self.a1n)
+                mx.initialise(weight)
+                HW.ArC.crossbar[curr_wordline].append(mx)
+                # self.state.weights[i + 5, j + 255 - in_size, 0] = abs(weights['W_out_trainee'][i][j])
+                if curr_bitline % 300 == 0:
+                    curr_wordline += 1
+                    curr_bitline = 0
+                curr_bitline += 1
 
     def custom_init(self):
         if not isinstance(HW.ArC, VirtualArC):
@@ -253,13 +357,16 @@ class Network(BaseThreadWrapper):
                 #functions.updateHistory(w, b, mx.Rmem, self.Vread, 0.0, 'S R')
                 #functions.displayUpdate.cast()
 
-
     @BaseThreadWrapper.runner
     def run(self):
         self.disableInterface.emit(True)
+        L2LMain.main(self)
+        return
+
 
         self.log("Reading all devices and initialising weights")
 
+        #self.experimental_init()
         self.custom_init()
 #        f = open("C:/Users/jh1d18/debug_log.txt", "a")
         # For every neuron in the system.
@@ -311,7 +418,7 @@ class Network(BaseThreadWrapper):
             for t in range(self.testSteps):
                 self.rawin = self.state.firingCells
                 self.rawinPseudo = self.state.firingCellsPseudo
-                self.log("---> Time step synapses update in trianing: %d RAWIN: %s STIMIN: %s RAWINPSEUDO: %s" % (t, self.rawin, self.stimin[:, t], self.rawinPseudo))
+                self.log("---> Time step synapses update in trianing: %d RAWIN: %s STIMIN: %s RAWINPSEUDO: %s" % (t, self.rawin, self.stiminForTesting[:, t], self.rawinPseudo))
                 self.core.neurons(self, t, phase = 'test')
                 self.displayData.emit()
 
@@ -367,6 +474,181 @@ class Network(BaseThreadWrapper):
 
         self.disableInterface.emit(False)
         self.finished.emit()
+
+    def reset_state(self):
+        labelCounter = 1
+        old_weights = self.state.weights
+        self.state = NetworkState(self.NETSIZE, self.DEPTH, self.inputNum, self.outputNum, self.epochs,
+                                            self.epochsForTesting, self.temporalCoding_enable, self.spikeTrain,
+                                            labelCounter)
+        self.state.weights = old_weights
+
+    def full_reset(self):
+        labelCounter = 1
+        self.state = NetworkState(self.NETSIZE, self.DEPTH, self.inputNum, self.outputNum, self.epochs,
+                                            self.epochsForTesting, self.temporalCoding_enable, self.spikeTrain,
+                                            labelCounter)
+        self.ConnMat = self.OrigConnMat.copy()
+
+    def trainee(self):
+        print("Starting trainee...")
+
+        if not self.state.test:
+            self.pre_crossbar = self.get_memristor_values()
+        else:
+            self.post_crossbar = self.get_memristor_values()
+
+        for t in range(self.tsteps):
+            self.rawin = self.state.firingCells
+            self.core.neurons(self, t, phase='training')
+            self.rawin = self.state.firingCells
+
+        trainee_output = tensorflow.convert_to_tensor([st[-2:] for st in self.state.NeurAccum], dtype=float32)
+        trainee_spikes = tensorflow.convert_to_tensor([st[5:-2] for st in self.state.fireCells], dtype=float32)
+        trainee_potential = tensorflow.convert_to_tensor([st[:-2] for st in self.state.NeurAccum], dtype=float32)
+        trainee_trace_in = tensorflow.convert_to_tensor([st[:5] for st in self.state.trace], dtype=float32)
+        trainee_trace_rec = tensorflow.convert_to_tensor([st[5:] for st in self.state.trace], dtype=float32)
+        dz_dh = tensorflow.convert_to_tensor(self.state.dz_dh, dtype=float32)
+
+        batch_size = 1
+        trainee_output = tensorflow.tile(tensorflow.expand_dims(trainee_output, axis=0), [batch_size, 1, 1])
+        trainee_spikes = tensorflow.tile(tensorflow.expand_dims(trainee_spikes, axis=0), [batch_size, 1, 1])
+        trainee_potential = tensorflow.tile(tensorflow.expand_dims(trainee_potential, axis=0), [batch_size, 1, 1])
+        trainee_trace_in = tensorflow.tile(tensorflow.expand_dims(trainee_trace_in, axis=0), [batch_size, 1, 1])
+        trainee_trace_rec = tensorflow.tile(tensorflow.expand_dims(trainee_trace_rec, axis=0), [batch_size, 1, 1])
+        dz_dh = tensorflow.tile(tensorflow.expand_dims(dz_dh, axis=0), [batch_size, 1, 1])
+
+        return trainee_output, trainee_spikes, trainee_potential, trainee_trace_in, trainee_trace_rec, dz_dh
+
+    def reprogram_weights(self, d_w_in, d_w_rec):
+        in_size = 5
+        rec_size = 250
+        curr_bitline = 1
+        curr_wordline = 1
+
+        for i in range(in_size):
+            for j in range(rec_size):
+                dW = d_w_in[0][i][j] if self.ConnMat[i, j+5, 2] > 0 else -d_w_in[0][i][j]
+                R = self.read(curr_wordline, curr_bitline)  # current R
+                p = 1 / R  # new weights
+                if self.params.get('NORMALISE', False):
+                    p_norm = self.normalise_weight(p)
+                    p_expect = dW + p_norm
+                    if p_expect < 0:
+                        p_expect = abs(p_expect)
+                        self.ConnMat[i, j + 5, 2] *= -1
+                    R_expect = self.de_normalise_resistance(p_expect)
+                else:
+                    p_expect = dW + p  # new weights
+                    if p_expect < 0:
+                        p_expect = abs(p_expect)
+                        self.ConnMat[i, j + 5, 2] *= -1
+                    R_expect = 1 / p_expect  # expected R
+
+                for step in range(self.maxSteps):
+                    if abs(R - R_expect) / R_expect < self.RTolerance:
+                        break
+                    if R - R_expect > 0:  # resistance needs to be decreased
+                        pulseList = self.neg_pulseList
+                    else:  # resistance needs to be increased
+                        pulseList = self.pos_pulseList
+                    virtualMemristor = memristorPulses(self.dt, self.Ap, self.An, self.a0p, self.a1p, self.a0n, self.a1n,
+                                                       self.tp, self.tn, R)
+                    pulseParams = virtualMemristor.BestPulseChoice(R_expect, pulseList)  # takes the best pulse choice
+                    del virtualMemristor
+                    self.pulse(curr_wordline, curr_bitline, pulseParams[0], pulseParams[1])
+                    R = self.read(curr_wordline, curr_bitline)
+
+                R_real = self.read(curr_wordline, curr_bitline)
+                p_real = 1 / R_real
+
+                print(f"Weight change {dW}, expected: {self.state.weights[i, j + 5 - in_size, 0]+dW}, got:  {self.normalise_weight(p_real)}")
+
+                if self.params.get('NORMALISE', False):
+                    self.state.weights[i, j + 5 - in_size, 0] = self.normalise_weight(p_real)
+                else:
+                    self.state.weights[i, j + 5 - in_size, 0] = p_real
+
+                self.state.weight_update_errors[i, j + 5 - in_size, 0] = p_expect-dW  # Old weight.
+                self.state.weight_update_errors[i, j + 5 - in_size, 1] = abs(self.normalise_weight(p_real) - p_expect)
+                self.state.weight_update_errors[i, j + 5 - in_size, 2] = dW
+
+                # self.state.weights[i, j + 5 - in_size, 0] += d_w_in[0][i][j] if self.ConnMat[i, j+5, 2] > 0 else -d_w_in[0][i][j]
+                if curr_bitline % 300 == 0:
+                    curr_wordline += 1
+                    curr_bitline = 0
+                curr_bitline += 1
+
+        for i in range(rec_size):
+            for j in range(rec_size):
+                if i == j:  # No recursive self connections.
+                    continue
+                dW = d_w_rec[0][i][j] if self.ConnMat[i+5, j+5, 2] > 0 else -d_w_rec[0][i][j]
+                R = self.read(curr_wordline, curr_bitline)  # current R
+                p = 1 / R  # new weights
+                if self.params.get('NORMALISE', False):
+                    p_norm = self.normalise_weight(p)
+                    p_expect = dW + p_norm
+                    if p_expect < 0:
+                        p_expect = abs(p_expect)
+                        self.ConnMat[i+5, j+5, 2] *= -1
+                    R_expect = self.de_normalise_resistance(p_expect)
+                else:
+                    p_expect = dW + p  # new weights
+                    if p_expect < 0:
+                        p_expect = abs(p_expect)
+                        self.ConnMat[i + 5, j + 5, 2] *= -1
+                    R_expect = 1 / p_expect  # expected R
+
+                for step in range(self.maxSteps):
+                    if abs(R - R_expect) / R_expect < self.RTolerance:
+                        break
+                    if R - R_expect > 0:  # resistance needs to be decreased
+                        pulseList = self.neg_pulseList
+                    else:  # resistance needs to be increased
+                        pulseList = self.pos_pulseList
+                    virtualMemristor = memristorPulses(self.dt, self.Ap, self.An, self.a0p, self.a1p, self.a0n,
+                                                       self.a1n,
+                                                       self.tp, self.tn, R)
+                    pulseParams = virtualMemristor.BestPulseChoice(R_expect, pulseList)  # takes the best pulse choice
+                    del virtualMemristor
+                    self.pulse(curr_wordline, curr_bitline, pulseParams[0], pulseParams[1])
+                    R = self.read(curr_wordline, curr_bitline)
+
+                R_real = self.read(curr_wordline, curr_bitline)
+                p_real = 1 / R_real
+
+                print(f"Weight change {dW}, expected: {self.state.weights[i + 5, j + 5 - in_size, 0] + dW}, got:  {self.normalise_weight(p_real)}")
+
+                if self.params.get('NORMALISE', False):
+                    self.state.weights[i + 5, j + 5 - in_size, 0] = self.normalise_weight(p_real)
+                else:
+                    self.state.weights[i + 5, j + 5 - in_size, 0] = p_real
+
+                self.state.weight_update_errors[i + 5, j + 5 - in_size, 0] = p_expect - dW  # Old weight.
+                self.state.weight_update_errors[i + 5, j + 5 - in_size, 1] = abs(self.normalise_weight(p_real) - p_expect)
+                self.state.weight_update_errors[i + 5, j + 5 - in_size, 2] = dW
+
+                # self.state.weights[i + 5, j + 5 - in_size, 0] += d_w_rec[0][i][j] if self.ConnMat[i+5, j+5, 2] > 0 else -d_w_rec[0][i][j]
+                if curr_bitline % 300 == 0:
+                    curr_wordline += 1
+                    curr_bitline = 0
+                curr_bitline += 1
+
+    def get_memristor_values(self):
+        """
+        @return a 2D array containing the values of all memristors in the crossbar array.
+        """
+        mem_values = []
+        for w in range(1, 301):
+            mem_values.append([])
+            for b in range(1, 301):
+                if len(HW.ArC.crossbar) > w and len(HW.ArC.crossbar[w]) > b:
+                    mem_values[w-1].append(self.read(w, b))
+                else:
+                    mem_values[w - 1].append(0)
+        return mem_values
+
 
     def read(self, w, b):
         # read a device and return read value
@@ -720,7 +1002,8 @@ class NeuroPack(BaseProgPanel):
             print('test_enable before calling network:', self.test_enable)
             network = Network(self.ConnMat, self.stimin, self.stiminForTesting, self.test_enable, data, params, \
                 tsteps, testSteps, coreName, self.labelCounter)
-            self.execute(network, network.run, True)
+            network.run()  # TODO David, maybe put back on separate thread.
+            #self.execute(network, network.run, True)
 
     def load_base_conf(self, fname):
         return json.load(open(fname))
@@ -1214,7 +1497,7 @@ class NeuroVarSnapRowWidget(Ui_NNVarSnapRow, QtWidgets.QWidget):
         self.stepSpinBox.setMinimum(0)
         self.stepSpinBox.setMaximum(int(dataset['meta']['trials'][0])-1)
 
-        self.NeuronSpinBox.setMinimum(int(self.dataset['meta']['inputNum'][0]))
+        self.NeuronSpinBox.setMinimum(int(dataset['meta']['inputNum'][0]))
         self.NeuronSpinBox.setMaximum(int(dataset['meta']['netsize'][0])-1)
 
         self.LayerSpinBox.setMinimum(1)

@@ -18,7 +18,7 @@ class memristorPulses:
     def ResistancePredict(self, pulseList):  # return the list of R for different pulses
         memristor = Device(self.Ap, self.An, self.a0p, self.a1p, self.a0n, self.a1n, self.tp, self.tn)
         res = []
-        f = open("C:/Users/jh1d18/debug_log.txt", "a")
+        f = open("debug_log.txt", "a+")
         for i in pulseList:
             memristor.initialise(self.R)
             f.write('pulsechoice')
@@ -39,7 +39,7 @@ class memristorPulses:
         res = self.ResistancePredict(pulseList)
         res_dist = np.absolute(np.array(res) - R_expect)
         print('res dist:', res_dist)
-        f = open("C:/Users/jh1d18/debug_log.txt", "a")
+        f = open("debug_log.txt", "a+")
         f.write('res dist:')
         line = ', '.join(str(i) for i in list(res_dist))
         f.write(line + '\n')

@@ -163,7 +163,7 @@ def neurons(net, time, phase = 'training'):
             wantToFire = wantToFire[ : net.NETSIZE - net.outputNum]
             wantToFire.extend(winnerTakeAll)
         net.log('wta fire state:', wantToFire)
-        f = open("C:/Users/jh1d18/debug_log_withoutMems.txt", "a")
+        f = open("debug_log_withoutMems.txt", "a+")
         for item in wantToFire[-net.outputNum : ]:
             f.write("%s" % item)
         f.write('---------------\n')
@@ -211,7 +211,7 @@ def plast(net, time):
             # delta = (S - y^hat)*(y + noise)
             # gradient = delta * weight
             net.log('neuron: %d, softmaxRes: %f, outputLabel: %d, fire hist: %d' %(neuron, softmaxRes[neuron-(fullNum - net.outputNum)], outputLabel[neuron], rawin[neuron]))
-            f = open("C:/Users/jh1d18/debug_log_withoutMems.txt", "a")
+            f = open("debug_log_withoutMems.txt", "a+")
             f.write('neuron: %d, membrane: %f, softmaxRes: %f, outputLabel: %d, fire hist: %d, fire hist after wta:%d\n' %(neuron, net.state.NeurAccum[time][neuron - net.inputNum], softmaxRes[neuron-(fullNum - net.outputNum)], outputLabel[neuron], rawinPseudo[neuron], rawin[neuron]))
             if rawin[neuron] == outputLabel[neuron]:
                 continue
@@ -251,7 +251,7 @@ def plast(net, time):
             grad = error[neuron] * allNeuronsThatFire[preidx]
             dW = (-1) * learningRate * grad
             net.log('dW:', dW)
-            f = open("C:/Users/jh1d18/debug_log_withoutMems.txt", "a")
+            f = open("debug_log_withoutMems.txt", "a+")
             f.write('dW:%g\n:' % dW)
             f.close()
 #           new line for debuging
@@ -287,7 +287,7 @@ def plast(net, time):
                 #net.state.weightsError[preidx, neuron, time+1] = p_error
             net.log(" weight change for synapse %d -- %d from %g to %g in step %d" % (preidx, neuron, net.state.weights[preidx, neuron - net.inputNum, time], net.state.weights[preidx, neuron - net.inputNum, time+1], time))
             net.log('---------------')
-            f = open("C:/Users/jh1d18/debug_log_withoutMems.txt", "a")
+            f = open("debug_log_withoutMems.txt", "a+")
             f.write(" weight change for synapse %d -- %d from %g to %g in step %d\n" % (preidx, neuron, net.state.weights[preidx, neuron - net.inputNum, time], net.state.weights[preidx, neuron - net.inputNum, time+1], time))
             f.write('---------------\n')
             f.close()
